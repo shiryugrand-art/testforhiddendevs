@@ -1,0 +1,445 @@
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local SwordService = require(script.Parent:WaitForChild("SwordService"))
+local shake = RS:WaitForChild("ScreenShake")
+local bossEvent = RS:WaitForChild("BossEvent")
+
+local Boss = {}
+local NAME = "The Iron Champion"
+local HP = 1500
+local GOLD_POOL, KILL_BONUS = 600, 150
+local CLEAVE_DMG, SLAM_DMG, CHARGE_DMG, SPIN_TICK, CRY_DMG = 23, 34, 30, 11, 26 -- 25% below the original 30/45/40/15/35
+local RED = Color3.fromRGB(230, 30, 36)
+local ANIMS = {walk = "rbxassetid://180426354", idle = "rbxassetid://180435571", hold = "rbxassetid://182393478", slash = "rbxassetid://129967390", lunge = "rbxassetid://129967478"}
+local current
+
+local function fx(props)
+	local p = Instance.new("Part")
+	p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false; p.CastShadow = false
+	p.TopSurface = Enum.SurfaceType.Smooth; p.BottomSurface = Enum.SurfaceType.Smooth
+	for k, v in pairs(props) do p[k] = v end
+	p.Parent = workspace
+	return p
+end
+local function burst(pe, n)
+	pe.Rate = n * 12; pe.Enabled = true
+	task.delay(0.08, function() pe.Enabled = false end)
+end
+local function sound(id, parent, vol, pitch)
+	local s = Instance.new("Sound"); s.SoundId = id; s.Volume = vol or 1; s.PlaybackSpeed = pitch or 1; s.RollOffMaxDistance = 1500; s.Parent = parent; s:Play()
+	Debris:AddItem(s, 8)
+end
+local ROAR, BOOM, RUMBLE = "rbxassetid://72827145254925", "rbxassetid://72827145254925", "rbxassetid://100284911213232"
+
+local rayParams = RaycastParams.new(); rayParams.FilterType = Enum.RaycastFilterType.Exclude
+local function groundAt(pos, ignore)
+	local list = {ignore}
+	for _, p in ipairs(Players:GetPlayers()) do if p.Character then table.insert(list, p.Character) end end
+	rayParams.FilterDescendantsInstances = list
+	local r = workspace:Raycast(Vector3.new(pos.X, pos.Y + 20, pos.Z), Vector3.new(0, -80, 0), rayParams)
+	return r and r.Position or Vector3.new(pos.X, 2, pos.Z)
+end
+
+local function targets()
+	local list = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		local c = p.Character
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		local r = c and c:FindFirstChild("HumanoidRootPart")
+		if h and r and h.Health > 0 and SwordService.inArena(r.Position) then table.insert(list, {p = p, c = c, h = h, r = r}) end
+	end
+	return list
+end
+
+local function hit(t, dmg, stunFor)
+	if t.c:GetAttribute("Invulnerable") then
+		local b = t.c:FindFirstChild("AegisBlocked"); if b and b:IsA("BindableEvent") then b:Fire() end
+		return
+	end
+	t.c:SetAttribute("CombatUntil", workspace:GetServerTimeNow() + 30)
+	t.h:TakeDamage(dmg)
+	if stunFor and t.h.Health > 0 then
+		local untilT = workspace:GetServerTimeNow() + stunFor
+		t.c:SetAttribute("RootedUntil", untilT)
+		t.h.WalkSpeed = 0; t.h.JumpPower = 0; t.h.JumpHeight = 0
+		task.delay(stunFor, function()
+			if (t.c:GetAttribute("RootedUntil") or 0) <= untilT + 0.01 then t.c:SetAttribute("RootedUntil", nil) end
+			if t.h.Parent then t.h.JumpPower = 50; t.h.JumpHeight = 7.2 end
+		end)
+	end
+end
+
+local function dust(pos, n, size, speed)
+	local d = fx({Size = Vector3.new(4, 1, 4), Transparency = 1, CFrame = CFrame.new(pos)})
+	local pe = Instance.new("ParticleEmitter"); pe.Texture = "rbxasset://textures/particles/smoke_main.dds"
+	pe.Color = ColorSequence.new(Color3.fromRGB(150, 110, 90), Color3.fromRGB(70, 45, 38)); pe.Rate = 0; pe.Size = NumberSequence.new(size or 3, (size or 3) * 2.5)
+	pe.Transparency = NumberSequence.new(0.25, 1); pe.Lifetime = NumberRange.new(0.8, 1.5); pe.Speed = NumberRange.new(speed or 10, (speed or 10) * 2)
+	pe.SpreadAngle = Vector2.new(80, 20); pe.EmissionDirection = Enum.NormalId.Top; pe.Acceleration = Vector3.new(0, -6, 0); pe.Parent = d
+	burst(pe, n or 30); Debris:AddItem(d, 2.5)
+end
+local function shockwave(pos, radius)
+	for _, e in ipairs({{RED, Enum.Material.Neon, 0.1, 0}, {Color3.fromRGB(60, 40, 34), Enum.Material.Slate, 0.2, 0.06}}) do
+		task.delay(e[4], function()
+			local ring = fx({Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.3, 3, 3), Color = e[1], Material = e[2], Transparency = e[3],
+				CFrame = CFrame.new(pos + Vector3.new(0, 0.2, 0)) * CFrame.Angles(0, 0, math.rad(90))})
+			TweenService:Create(ring, TweenInfo.new(0.55, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {Size = Vector3.new(0.05, radius * 2.2, radius * 2.2), Transparency = 1}):Play()
+			Debris:AddItem(ring, 0.6)
+		end)
+	end
+end
+local function telegraphCircle(pos, radius, t)
+	local disc = fx({Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.08, radius * 2, radius * 2), Color = RED, Material = Enum.Material.Neon, Transparency = 0.75,
+		CFrame = CFrame.new(pos + Vector3.new(0, 0.12, 0)) * CFrame.Angles(0, 0, math.rad(90))})
+	local fill = fx({Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.1, 0.5, 0.5), Color = RED, Material = Enum.Material.Neon, Transparency = 0.45,
+		CFrame = CFrame.new(pos + Vector3.new(0, 0.14, 0)) * CFrame.Angles(0, 0, math.rad(90))})
+	TweenService:Create(fill, TweenInfo.new(t, Enum.EasingStyle.Linear), {Size = Vector3.new(0.1, radius * 2, radius * 2)}):Play()
+	Debris:AddItem(disc, t + 0.05); Debris:AddItem(fill, t + 0.05)
+end
+
+function Boss.despawn()
+	if current and current.Parent then
+		bossEvent:FireAllClients("despawn", NAME)
+		current:Destroy(); current = nil
+		return true, NAME .. " was banished."
+	end
+	return false, "There's no boss in the arena."
+end
+
+function Boss.spawn(award)
+	if current and current.Parent then return false, NAME .. " is already in the arena." end
+	local m = ServerStorage:WaitForChild("IronChampion"):Clone()
+	current = m
+	local hum = m:FindFirstChildOfClass("Humanoid")
+	local root = m:FindFirstChild("HumanoidRootPart")
+	hum.MaxHealth = HP; hum.Health = HP; hum.WalkSpeed = 13
+	m:SetAttribute("BossName", NAME)
+	CollectionService:AddTag(m, "ArenaBoss")
+	local hipY = root.Position.Y - (m:GetBoundingBox().Position.Y - m:GetExtentsSize().Y / 2)
+	local g = groundAt(Vector3.new(0, 10, 0), m)
+	-- entrance: he appears on top of the colosseum wall and leaps down onto the dais
+	local wallHit = workspace:Raycast(Vector3.new(0, 185, 161.5), Vector3.new(0, -300, 0))
+	local wallTop = wallHit and wallHit.Position or Vector3.new(0, 74, 161.5)
+	local P0 = CFrame.lookAt(wallTop + Vector3.new(0, hipY, 0), Vector3.new(0, wallTop.Y + hipY, 0))
+	local stand = g + Vector3.new(0, hipY, 0)
+	local P1 = CFrame.lookAt(stand, stand + P0.LookVector * Vector3.new(1, 0, 1))
+	local INTRO = require(RS:WaitForChild("BossPoses")).LENGTH
+	m.ModelStreamingMode = Enum.ModelStreamingMode.Persistent
+	m:SetAttribute("Invulnerable", true)
+	root.Anchored = true
+	m:PivotTo(P0)
+	m.Parent = workspace
+	-- everyone freezes and watches (and the arena streams in for anyone up in the lobby)
+	local frozen = {}
+	local lead = 1.0
+	for _, p in ipairs(Players:GetPlayers()) do
+		task.spawn(function() pcall(function() p:RequestStreamAroundAsync(Vector3.new(0, 30, 80), 3) end) end)
+		local c = p.Character
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		if h and h.Health > 0 then
+			c:SetAttribute("RootedUntil", workspace:GetServerTimeNow() + lead + INTRO + 0.5)
+			c:SetAttribute("Invulnerable", true)
+			h.WalkSpeed = 0; h.JumpPower = 0; h.JumpHeight = 0
+			table.insert(frozen, {c = c, h = h})
+		end
+	end
+	local startAt = workspace:GetServerTimeNow() + lead
+	bossEvent:FireAllClients("intro", m, P0, P1, startAt, NAME)
+
+	local animator = hum:FindFirstChildOfClass("Animator")
+	local tr = {}
+	for k, id in pairs(ANIMS) do local a = Instance.new("Animation"); a.AnimationId = id; tr[k] = animator:LoadAnimation(a) end
+	tr.idle.Priority = Enum.AnimationPriority.Idle; tr.idle.Looped = true
+	tr.walk.Priority = Enum.AnimationPriority.Movement; tr.walk.Looped = true
+	tr.hold.Priority = Enum.AnimationPriority.Action; tr.hold.Looped = true
+	tr.slash.Priority = Enum.AnimationPriority.Action2; tr.lunge.Priority = Enum.AnimationPriority.Action2
+	hum.Running:Connect(function(speed)
+		if speed > 0.5 then if not tr.walk.IsPlaying then tr.walk:Play(0.2) end; tr.walk:AdjustSpeed(math.clamp(speed / 14, 0.6, 2.2))
+		elseif tr.walk.IsPlaying then tr.walk:Stop(0.25) end
+	end)
+
+	-- damage ledger (every attack in the game tags the victim with a "creator" before damaging)
+	local ledger, lastHitter = {}, nil
+	local pending = false
+	local function publish()
+		if pending then return end
+		pending = true
+		task.delay(0.25, function()
+			pending = false
+			local arr = {}
+			for p, d in pairs(ledger) do if p.Parent then table.insert(arr, {name = p.DisplayName, id = p.UserId, dmg = math.floor(d)}) end end
+			table.sort(arr, function(a, b) return a.dmg > b.dmg end)
+			while #arr > 3 do table.remove(arr) end
+			if m.Parent then m:SetAttribute("TopDamage", game:GetService("HttpService"):JSONEncode(arr)) end
+		end)
+	end
+	local last = hum.Health
+	hum.HealthChanged:Connect(function(h)
+		local d = last - h; last = h
+		if d > 0 then
+			local tag = hum:FindFirstChild("creator")
+			local p = tag and tag.Value
+			if p and p:IsA("Player") then ledger[p] = (ledger[p] or 0) + d; lastHitter = p; publish() end
+		end
+	end)
+
+	task.spawn(function()
+		-- wait out the cutscene (every client animates the leap locally), then the fight begins
+		while workspace:GetServerTimeNow() < startAt + INTRO do task.wait(0.05) end
+		if not m.Parent then return end
+		m:PivotTo(P1)
+		for _, f in ipairs(frozen) do
+			if f.c.Parent then f.c:SetAttribute("RootedUntil", nil); f.c:SetAttribute("Invulnerable", nil) end
+			if f.h.Parent and f.h.Health > 0 then f.h.JumpPower = 50; f.h.JumpHeight = 7.2; if not f.c:GetAttribute("SpeedOverride") then f.h.WalkSpeed = 16 end end
+		end
+		m:SetAttribute("Invulnerable", nil)
+		tr.idle:Play(); tr.hold:Play()
+		root.Anchored = false
+		pcall(function() root:SetNetworkOwner(nil) end)
+
+		local cd = {cleave = 0, slam = os.clock() + 5, charge = os.clock() + 9, spin = os.clock() + 14, cry = 0}
+		local enraged = false
+		local function face(pos)
+			local flat = (pos - root.Position) * Vector3.new(1, 0, 1)
+			if flat.Magnitude > 0.1 then root.CFrame = CFrame.lookAt(root.Position, root.Position + flat) end
+		end
+
+		local function cleave(t)
+			hum.AutoRotate = false; hum:MoveTo(root.Position); face(t.r.Position)
+			tr.slash:Play(0.08, 1, enraged and 0.95 or 0.8)
+			sound("rbxassetid://9126229280", root, 1.2, 0.6)
+			task.wait(0.38)
+			if hum.Health <= 0 then return end
+			local look = root.CFrame.LookVector
+			for _, v in ipairs(targets()) do
+				local flat = (v.r.Position - root.Position) * Vector3.new(1, 0, 1)
+				if flat.Magnitude <= 14 and (flat.Magnitude < 3 or flat.Unit:Dot(look) > 0.35) then hit(v, CLEAVE_DMG, 0.25) end
+			end
+			shake:FireAllClients(root.Position, 3, 0.3)
+			dust(root.Position + look * 9 - Vector3.new(0, hipY - 0.5, 0), 12, 2, 6)
+			task.wait(0.45)
+			hum.AutoRotate = true
+			cd.cleave = os.clock() + (enraged and 1.1 or 1.6)
+		end
+
+		local function slam(t)
+			hum.AutoRotate = false; hum:MoveTo(root.Position)
+			local from = root.Position
+			local flat = (t.r.Position - from) * Vector3.new(1, 0, 1)
+			local land = from + (flat.Magnitude > 0.1 and flat.Unit * math.min(flat.Magnitude, 26) or Vector3.zero)
+			local lg = groundAt(land, m)
+			if not SwordService.inArena(lg) then lg = groundAt(from, m) end
+			face(lg)
+			sound(ROAR, root, 1.6, 0.8)
+			telegraphCircle(lg, 16, 1.05)
+			task.wait(0.25)
+			tr.lunge:Play(0.1, 1, 0.7)
+			root.Anchored = true
+			local goal = lg + Vector3.new(0, hipY, 0)
+			local st = root.Position
+			local t0 = os.clock()
+			while true do
+				local k = math.min((os.clock() - t0) / 0.8, 1)
+				local pos = st:Lerp(goal, k) + Vector3.new(0, math.sin(math.pi * k) * 18, 0)
+				root.CFrame = CFrame.lookAt(pos, pos + (goal - st) * Vector3.new(1, 0, 1) + root.CFrame.LookVector * 0.01)
+				if k >= 1 then break end
+				RunService.Heartbeat:Wait()
+			end
+			tr.slash:Play(0.05, 1, 1.4)
+			sound(BOOM, root, 2.2, 0.55); sound(RUMBLE, root, 1.2)
+			shake:FireAllClients(lg, 10, 0.9)
+			shockwave(lg, 16); dust(lg, 40, 3.5, 14)
+			for _, v in ipairs(targets()) do
+				if ((v.r.Position - lg) * Vector3.new(1, 0, 1)).Magnitude <= 16 then hit(v, SLAM_DMG, 0.8) end
+			end
+			-- cracks where he landed
+			for i = 1, 7 do
+				local a = i / 7 * math.pi * 2 + math.random() * 0.4
+				local len = math.random(6, 11)
+				local c = fx({Size = Vector3.new(0.5, 0.1, len), Color = Color3.fromRGB(20, 6, 8), Material = Enum.Material.Slate,
+					CFrame = CFrame.lookAt(lg + Vector3.new(math.cos(a), 0, math.sin(a)) * len / 2 + Vector3.new(0, 0.05, 0), lg + Vector3.new(math.cos(a), 0, math.sin(a)) * len + Vector3.new(0, 0.05, 0))})
+				local cg = fx({Size = Vector3.new(0.18, 0.12, len), Color = RED, Material = Enum.Material.Neon, CFrame = c.CFrame + Vector3.new(0, 0.01, 0)})
+				task.delay(3, function() for _, p in ipairs({c, cg}) do TweenService:Create(p, TweenInfo.new(1), {Transparency = 1}):Play(); Debris:AddItem(p, 1.1) end end)
+			end
+			task.wait(0.15)
+			root.Anchored = false
+			task.wait(0.55)
+			hum.AutoRotate = true
+			cd.slam = os.clock() + (enraged and 7 or 10)
+		end
+
+		local function charge(t)
+			hum.AutoRotate = false; hum:MoveTo(root.Position)
+			face(t.r.Position)
+			local dir = root.CFrame.LookVector
+			local len = 48
+			local strip = fx({Size = Vector3.new(7, 0.1, len), Color = RED, Material = Enum.Material.Neon, Transparency = 0.7,
+				CFrame = CFrame.lookAt(root.Position + dir * len / 2, root.Position + dir * len) - Vector3.new(0, hipY - 0.15, 0)})
+			Debris:AddItem(strip, 0.9)
+			sound(ROAR, root, 1.8, 0.9)
+			tr.hold:Stop(0.1); tr.lunge:Play(0.1, 1, 0.5)
+			task.wait(0.8)
+			if hum.Health <= 0 then return end
+			local endPos = root.Position + dir * len
+			if not SwordService.inArena(endPos) then endPos = root.Position + dir * (len * 0.5) end
+			hum.WalkSpeed = 62; hum:MoveTo(endPos)
+			local hitSet = {}
+			local t0 = os.clock()
+			local trail = Instance.new("ParticleEmitter"); trail.Texture = "rbxasset://textures/particles/smoke_main.dds"; trail.Color = ColorSequence.new(Color3.fromRGB(140, 100, 80))
+			trail.Rate = 40; trail.Size = NumberSequence.new(2, 5); trail.Transparency = NumberSequence.new(0.4, 1); trail.Lifetime = NumberRange.new(0.6, 1); trail.Speed = NumberRange.new(2, 5)
+			trail.Parent = root
+			while os.clock() - t0 < 1.1 and hum.Health > 0 do
+				for _, v in ipairs(targets()) do
+					if not hitSet[v.p] and (v.r.Position - root.Position).Magnitude < 8 then hitSet[v.p] = true; hit(v, CHARGE_DMG, 0.6); shake:FireAllClients(v.r.Position, 6, 0.4) end
+				end
+				if ((endPos - root.Position) * Vector3.new(1, 0, 1)).Magnitude < 3 then break end
+				RunService.Heartbeat:Wait()
+			end
+			trail.Enabled = false; Debris:AddItem(trail, 1)
+			hum.WalkSpeed = enraged and 17 or 13; hum:MoveTo(root.Position)
+			tr.hold:Play(0.2)
+			task.wait(0.5)
+			hum.AutoRotate = true
+			cd.charge = os.clock() + (enraged and 9 or 13)
+		end
+
+		-- Whirlwind: spins with the axe out, dragging himself after his prey; 4 hits of 15
+		local function whirlwind(t)
+			hum.AutoRotate = false
+			sound(ROAR, root, 1.6, 1.0)
+			telegraphCircle(root.Position - Vector3.new(0, hipY - 0.1, 0), 13, 0.6)
+			task.wait(0.6)
+			if hum.Health <= 0 then return end
+			tr.hold:Stop(0.1)
+			tr.slash:Play(0.05, 1, 0.4)
+			hum.WalkSpeed = 10
+			local ring = fx({Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.2, 26, 26), Color = RED, Material = Enum.Material.Neon, Transparency = 0.7, CFrame = CFrame.new(root.Position)})
+			local t0, nextTick, angle = os.clock(), os.clock() + 0.25, 0
+			while os.clock() - t0 < 2.4 and hum.Health > 0 do
+				local dt = RunService.Heartbeat:Wait()
+				angle += dt * 14
+				root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, angle, 0)
+				ring.CFrame = CFrame.new(root.Position - Vector3.new(0, hipY - 0.15, 0)) * CFrame.Angles(0, 0, math.rad(90))
+				if t.r.Parent then hum:MoveTo(t.r.Position) end
+				if os.clock() >= nextTick then
+					nextTick += 0.6
+					sound("rbxassetid://9119749931", root, 1.4, 0.55)
+					for _, v in ipairs(targets()) do
+						if ((v.r.Position - root.Position) * Vector3.new(1, 0, 1)).Magnitude <= 13 then hit(v, SPIN_TICK) end
+					end
+					dust(root.Position - Vector3.new(0, hipY - 0.5, 0), 10, 2.5, 12)
+				end
+			end
+			ring:Destroy()
+			hum.WalkSpeed = enraged and 17 or 13; hum:MoveTo(root.Position)
+			tr.hold:Play(0.2)
+			task.wait(0.4)
+			hum.AutoRotate = true
+			cd.spin = os.clock() + (enraged and 12 or 16)
+		end
+
+		-- War Cry (enraged only): a roar that blasts everyone nearby and pins them in place
+		local function warCry()
+			hum.AutoRotate = false; hum:MoveTo(root.Position)
+			tr.slash:Play(0.1, 1, 0.5)
+			local feet = root.Position - Vector3.new(0, hipY - 0.1, 0)
+			telegraphCircle(feet, 24, 0.8)
+			task.wait(0.8)
+			if hum.Health <= 0 then return end
+			sound(ROAR, root, 3, 0.5); sound(RUMBLE, root, 1.5)
+			shake:FireAllClients(root.Position, 11, 1)
+			shockwave(feet, 24)
+			local orb = fx({Shape = Enum.PartType.Ball, Size = Vector3.new(6, 6, 6), Color = RED, Material = Enum.Material.Neon, Transparency = 0.3, CFrame = CFrame.new(root.Position)})
+			TweenService:Create(orb, TweenInfo.new(0.5, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {Size = Vector3.new(40, 40, 40), Transparency = 1}):Play()
+			Debris:AddItem(orb, 0.55)
+			for _, v in ipairs(targets()) do
+				if ((v.r.Position - root.Position) * Vector3.new(1, 0, 1)).Magnitude <= 24 then hit(v, CRY_DMG, 1.2) end
+			end
+			task.wait(0.6)
+			hum.AutoRotate = true
+			cd.cry = os.clock() + 18
+		end
+
+		while m.Parent and hum.Health > 0 do
+			if not enraged and hum.Health <= HP * 0.5 then
+				enraged = true
+				m:SetAttribute("Enraged", true)
+				hum.WalkSpeed = 17
+				sound(ROAR, root, 2.5, 0.6)
+				shake:FireAllClients(root.Position, 8, 1)
+				shockwave(root.Position - Vector3.new(0, hipY - 0.3, 0), 22)
+				bossEvent:FireAllClients("enrage", NAME)
+				cd.cry = os.clock() + 2
+				for _, d in ipairs(m:GetDescendants()) do
+					if d:IsA("BasePart") and (d.Name == "AxeEdge" or d.Name == "Eyes") then
+						local fire = Instance.new("Fire"); fire.Color = RED; fire.SecondaryColor = Color3.fromRGB(40, 0, 4); fire.Size = 6; fire.Heat = 9; fire.Parent = d
+					end
+				end
+			end
+			local list = targets()
+			local best, bd
+			for _, v in ipairs(list) do
+				local d = ((v.r.Position - root.Position) * Vector3.new(1, 0, 1)).Magnitude
+				if not bd or d < bd then best, bd = v, d end
+			end
+			local now = os.clock()
+			if not best then
+				hum:MoveTo(g + Vector3.new(0, hipY, 0))
+			elseif enraged and now >= cd.cry and bd < 20 then warCry()
+			elseif now >= cd.slam and bd < 26 then slam(best)
+			elseif now >= cd.spin and bd < 14 then whirlwind(best)
+			elseif now >= cd.charge and bd > 18 and bd < 80 then charge(best)
+			elseif bd <= 12 and now >= cd.cleave then cleave(best)
+			else
+				local flat = (best.r.Position - root.Position) * Vector3.new(1, 0, 1)
+				hum:MoveTo(best.r.Position - (flat.Magnitude > 0.1 and flat.Unit * 7 or Vector3.zero))
+			end
+			task.wait(0.12)
+		end
+	end)
+
+	hum.Died:Connect(function()
+		-- spoils, by damage share
+		local total = 0
+		for p, d in pairs(ledger) do if p.Parent then total += d end end
+		local results = {}
+		for p, d in pairs(ledger) do
+			if p.Parent and d >= 1 then
+				local gold = math.max(10, math.floor(GOLD_POOL * d / math.max(total, 1) + 0.5))
+				if p == lastHitter then gold += KILL_BONUS end
+				if award then pcall(award, p, gold, "Slew " .. NAME .. "!") end
+				table.insert(results, {name = p.DisplayName, dmg = math.floor(d), gold = gold})
+			end
+		end
+		table.sort(results, function(a, b) return a.dmg > b.dmg end)
+		bossEvent:FireAllClients("defeat", NAME, lastHitter and lastHitter.DisplayName or nil, {results[1], results[2], results[3]})
+		-- the champion topples and his armour crashes to the ground
+		sound(ROAR, root, 2, 0.45)
+		for _, d in ipairs(m:GetDescendants()) do
+			if d:IsA("Motor6D") then d:Destroy()
+			elseif d:IsA("BasePart") and d.Name == "Eyes" then d.Material = Enum.Material.SmoothPlastic; d.Color = Color3.fromRGB(40, 8, 10); for _, f in ipairs(d:GetChildren()) do f:Destroy() end end
+		end
+		for _, p in ipairs(m:GetChildren()) do
+			if p:IsA("BasePart") and p ~= root then
+				p.CanCollide = true
+				p.AssemblyLinearVelocity = Vector3.new(math.random(-12, 12), math.random(4, 14), math.random(-12, 12))
+				p.AssemblyAngularVelocity = Vector3.new(math.random(-4, 4), math.random(-4, 4), math.random(-4, 4))
+			end
+		end
+		root.CanCollide = false
+		task.delay(0.6, function() if root.Parent then dust(root.Position - Vector3.new(0, 4, 0), 40, 4, 10); shake:FireAllClients(root.Position, 7, 0.6) end end)
+		task.delay(6, function()
+			for _, d in ipairs(m:GetDescendants()) do if d:IsA("BasePart") then TweenService:Create(d, TweenInfo.new(1.5), {Transparency = 1}):Play() end end
+			task.wait(1.6)
+			if m.Parent then m:Destroy() end
+			if current == m then current = nil end
+		end)
+	end)
+	return true, NAME .. " has been summoned!"
+end
+
+return Boss
